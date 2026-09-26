@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { createClient } from "genlayer-js";
 import { studionet } from "genlayer-js/chains";
 import { TransactionStatus } from "genlayer-js/types";
@@ -17,6 +17,8 @@ import {
 } from "lucide-react";
 const ADDRESS = import.meta.env.VITE_CONTRACT_ADDRESS || "";
 const configured = /^0x[a-fA-F0-9]{40}$/.test(ADDRESS);
+const CHAIN_ID = "0xf22f";
+const EXPLORER = "https://explorer-studio.genlayer.com";
 const slots = ["DOCUMENTATION", "IMPLEMENTATION", "TESTS"];
 const icons = [FileText, FileCode2, FlaskConical];
 const empty = {
@@ -49,73 +51,191 @@ export default function App() {
     [panel, setPanel] = useState(false),
     [guide, setGuide] = useState(false),
     [account, setAccount] = useState(""),
+    [chainId, setChainId] = useState(""),
     [notice, setNotice] = useState(""),
     [busy, setBusy] = useState(false),
     [loading, setLoading] = useState(true),
-    [tx, setTx] = useState("");
+    [hasSnapshot, setHasSnapshot] = useState(false),
+    [syncState, setSyncState] = useState("CONNECTING"),
+    [txRecord, setTxRecord] = useState(() => {
+      try {
+        return JSON.parse(localStorage.getItem("fsa:lastTx")) || null;
+      } catch {
+        return null;
+      }
+    });
+  const mounted = useRef(true);
   const read = () => createClient({ chain: studionet });
-  async function refresh() {
+  const saveTx = (next) => {
+    setTxRecord(next);
+    if (next) localStorage.setItem("fsa:lastTx", JSON.stringify(next));
+    else localStorage.removeItem("fsa:lastTx");
+  };
+  const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+  async function retryRead(operation, retries = 3) {
+    let last;
+    for (let attempt = 1; attempt <= retries; attempt++) {
+      try {
+        return await operation();
+      } catch (error) {
+        last = error;
+        if (attempt < retries) await delay(900 * attempt);
+      }
+    }
+    throw last;
+  }
+  async function refresh({ quiet = false } = {}) {
     if (!configured) {
       setLoading(false);
+      setSyncState("MISCONFIGURED");
       return;
     }
-    setLoading(true);
+    if (!quiet || !hasSnapshot) setLoading(true);
+    setSyncState("SYNCING");
     try {
+      const client = read();
       const c = JSON.parse(
-          await read().readContract({
+          await retryRead(() => client.readContract({
             address: ADDRESS,
             functionName: "get_counts",
             args: [],
-          }),
+          })),
         ),
         list = [];
       for (let i = 0; i < c.audit_count; i++) {
         const audit = JSON.parse(
-          await read().readContract({
+          await retryRead(() => client.readContract({
             address: ADDRESS,
             functionName: "get_audit",
             args: [BigInt(i)],
-          }),
+          })),
         );
         audit.sources = {};
         for (const slot of slots) {
           const e = JSON.parse(
-            await read().readContract({
+            await retryRead(() => client.readContract({
               address: ADDRESS,
               functionName: "get_evidence",
               args: [BigInt(i), slot],
-            }),
+            })),
           );
           if (!e.error) audit.sources[slot] = e;
         }
         list.push(audit);
       }
+      if (!mounted.current) return;
       setAudits(list);
+      setHasSnapshot(true);
+      setSyncState("LIVE");
       setSelected((s) =>
         s ? list.find((a) => a.audit_id === s.audit_id) : null,
       );
     } catch (e) {
-      setNotice(`StudioNet readback unavailable: ${e.message}`);
+      setSyncState(hasSnapshot ? "STALE" : "UNAVAILABLE");
+      setNotice(
+        hasSnapshot
+          ? `StudioNet temporarily unavailable; preserving the last verified snapshot. ${e.message}`
+          : `StudioNet readback unavailable; no zero-state substitution was made. ${e.message}`,
+      );
     } finally {
       setLoading(false);
     }
   }
   useEffect(() => {
+    mounted.current = true;
     refresh();
+    const provider = window.ethereum;
+    if (!provider) return () => { mounted.current = false; };
+    const restore = async () => {
+      try {
+        const [accounts, chain] = await Promise.all([
+          provider.request({ method: "eth_accounts" }),
+          provider.request({ method: "eth_chainId" }),
+        ]);
+        setAccount(accounts?.[0] || "");
+        setChainId(chain || "");
+      } catch {
+        setNotice("Wallet reconnection is required.");
+      }
+    };
+    const accountsChanged = (accounts) => {
+      setAccount(accounts?.[0] || "");
+      setNotice(accounts?.[0] ? "Wallet account changed." : "Wallet disconnected. Reconnect to write.");
+    };
+    const chainChanged = (chain) => {
+      setChainId(chain || "");
+      setNotice(chain?.toLowerCase() === CHAIN_ID ? "StudioNet detected." : "Wrong network. Switch to StudioNet (61999)." );
+      refresh({ quiet: true });
+    };
+    restore();
+    provider.on?.("accountsChanged", accountsChanged);
+    provider.on?.("chainChanged", chainChanged);
+    return () => {
+      mounted.current = false;
+      provider.removeListener?.("accountsChanged", accountsChanged);
+      provider.removeListener?.("chainChanged", chainChanged);
+    };
+  }, []);
+  useEffect(() => {
+    if (txRecord?.hash && ["SUBMITTED", "PENDING", "TIMEOUT"].includes(txRecord.phase)) {
+      reconcileTransaction(txRecord.hash, true);
+    }
   }, []);
   async function connect() {
     if (!window.ethereum) return setNotice("Install an injected wallet.");
-    const [a] = await window.ethereum.request({
-      method: "eth_requestAccounts",
-    });
-    setAccount(a);
+    try {
+      const [a] = await window.ethereum.request({ method: "eth_requestAccounts" });
+      const chain = await window.ethereum.request({ method: "eth_chainId" });
+      setAccount(a || "");
+      setChainId(chain || "");
+      if (chain?.toLowerCase() !== CHAIN_ID) setNotice("Connected, but switch the wallet to StudioNet (61999) before writing.");
+      else setNotice("Wallet connected to StudioNet.");
+    } catch (error) {
+      setNotice(error?.code === 4001 ? "Wallet connection rejected by user." : `Wallet connection failed: ${error.message}`);
+    }
+  }
+  async function reconcileTransaction(hash, resumed = false) {
+    setBusy(true);
+    saveTx({ hash, phase: "PENDING", status: "Waiting for finalized consensus", resumed });
+    try {
+      const receipt = await read().waitForTransactionReceipt({
+        hash,
+        status: TransactionStatus.FINALIZED,
+        interval: 3000,
+        retries: 60,
+      });
+      const actual = receipt.status_name || receipt.status || "FINALIZED";
+      if (actual !== TransactionStatus.FINALIZED) {
+        const failed = ["CANCELED", "UNDETERMINED", "VALIDATORS_TIMEOUT", "LEADER_TIMEOUT"].includes(actual);
+        saveTx({ hash, phase: failed ? "FAILED" : "REVERTED", status: actual });
+        setNotice(`Transaction did not finalize successfully: ${actual}.`);
+        return;
+      }
+      const reconciled = await refresh({ quiet: true });
+      saveTx({ hash, phase: "FINALIZED", status: "FINALIZED · canonical state reconciled" });
+      setNotice("Finalized successfully; UI reconciled from the canonical contract read.");
+      return reconciled;
+    } catch (error) {
+      const text = error?.shortMessage || error?.message || "Unknown error";
+      const timeout = /timeout|retries|timed out/i.test(text);
+      const reverted = /revert|execution reverted/i.test(text);
+      const phase = timeout ? "TIMEOUT" : reverted ? "REVERTED" : "FAILED";
+      saveTx({ hash, phase, status: text });
+      setNotice(timeout ? "Consensus wait timed out. The hash is retained; use Check status to resume." : `${phase === "REVERTED" ? "Transaction reverted" : "Transaction failed"} after submission: ${text}`);
+    } finally {
+      setBusy(false);
+    }
   }
   async function write(fn, args) {
     setBusy(true);
-    setTx("");
     try {
       if (!configured) throw Error("Contract address is not configured.");
       if (!account) throw Error("Connect a wallet first.");
+      if (!window.ethereum) throw Error("Injected wallet unavailable.");
+      const liveAccounts = await window.ethereum.request({ method: "eth_accounts" });
+      const liveChain = await window.ethereum.request({ method: "eth_chainId" });
+      if (!liveAccounts?.[0] || liveAccounts[0].toLowerCase() !== account.toLowerCase()) throw Error("Wallet account changed. Reconnect before writing.");
+      if (liveChain?.toLowerCase() !== CHAIN_ID) throw Error("Wrong network. Switch wallet to StudioNet (chain 61999).");
       const client = createClient({
         chain: studionet,
         provider: window.ethereum,
@@ -126,16 +246,16 @@ export default function App() {
         functionName: fn,
         args,
       });
-      setTx(hash);
-      setNotice("Waiting for finalized consensus…");
-      await read().waitForTransactionReceipt({
-        hash,
-        status: TransactionStatus.FINALIZED,
-      });
-      await refresh();
-      setNotice("Finalized and reconciled with authoritative state.");
+      saveTx({ hash, phase: "SUBMITTED", status: "Submitted to StudioNet" });
+      setNotice("Transaction submitted. Waiting for finalized consensus…");
+      await reconcileTransaction(hash);
     } catch (e) {
-      setNotice(e.shortMessage || e.message);
+      const text = e.shortMessage || e.message || "Unknown error";
+      const rejected = e?.code === 4001 || /rejected|denied/i.test(text);
+      const reverted = /revert|execution reverted/i.test(text);
+      const phase = rejected ? "REJECTED" : reverted ? "REVERTED" : "FAILED";
+      saveTx({ hash: "", phase, status: text });
+      setNotice(rejected ? "Transaction rejected in wallet; nothing was submitted." : `${phase === "REVERTED" ? "Transaction reverted" : "Transaction failed"} before submission: ${text}`);
     } finally {
       setBusy(false);
     }
@@ -169,7 +289,9 @@ export default function App() {
             <BookOpen />
             Method
           </button>
-          <span>● StudioNet · 61999</span>
+          <span className={chainId && chainId.toLowerCase() !== CHAIN_ID ? "network wrong" : "network"}>
+            ● StudioNet · 61999 {chainId && chainId.toLowerCase() !== CHAIN_ID ? "· WRONG CHAIN" : ""}
+          </span>
           <button className="wallet" onClick={connect}>
             {account ? short(account) : "Connect wallet"}
           </button>
@@ -196,19 +318,19 @@ export default function App() {
         </section>
         <section className="stats">
           <div>
-            <b>{audits.length}</b>
+            <b>{hasSnapshot ? audits.length : "—"}</b>
             <span>TOTAL AUDITS</span>
           </div>
           <div>
-            <b>{counts.draft}</b>
+            <b>{hasSnapshot ? counts.draft : "—"}</b>
             <span>DRAFT</span>
           </div>
           <div>
-            <b>{counts.sealed}</b>
+            <b>{hasSnapshot ? counts.sealed : "—"}</b>
             <span>SEALED</span>
           </div>
           <div>
-            <b>{counts.final}</b>
+            <b>{hasSnapshot ? counts.final : "—"}</b>
             <span>FINALIZED</span>
           </div>
         </section>
@@ -230,16 +352,26 @@ export default function App() {
                   </a>
                 )}
               </div>
+              <div className={`sync-state ${syncState.toLowerCase()}`}>
+                {syncState === "LIVE" ? "● LIVE CANONICAL STATE" : `● ${syncState}`}
+                {hasSnapshot && syncState === "STALE" ? " · LAST VERIFIED SNAPSHOT RETAINED" : ""}
+              </div>
             </div>
             <button onClick={refresh}>
               <RefreshCw />
               Refresh
             </button>
           </div>
-          {loading ? (
+          {loading && !hasSnapshot ? (
             <div className="empty">
               <Loader2 className="spin" />
               Reading StudioNet…
+            </div>
+          ) : !hasSnapshot ? (
+            <div className="empty unavailable-state">
+              <ShieldCheck />
+              <h3>Canonical state unavailable</h3>
+              <p>No zero records were substituted. Retry the StudioNet readback.</p>
             </div>
           ) : audits.length ? (
             <div className="table">
@@ -288,17 +420,22 @@ export default function App() {
             </div>
           )}
         </section>
-        {notice && (
+        {(notice || txRecord) && (
           <div className="notice">
             {busy && <Loader2 className="spin" />}
-            {notice}
-            {tx && (
+            <span>{notice || txRecord?.status}</span>
+            {txRecord?.phase && <mark className={`tx-phase ${txRecord.phase.toLowerCase()}`}>{txRecord.phase}</mark>}
+            {txRecord?.hash && (
               <a
                 target="_blank"
-                href={`https://explorer-studio.genlayer.com/tx/${tx}`}
+                rel="noreferrer"
+                href={`${EXPLORER}/tx/${txRecord.hash}`}
               >
                 Transaction <ArrowUpRight />
               </a>
+            )}
+            {txRecord?.hash && ["TIMEOUT", "FAILED"].includes(txRecord.phase) && (
+              <button onClick={() => reconcileTransaction(txRecord.hash, true)}>Check status</button>
             )}
           </div>
         )}

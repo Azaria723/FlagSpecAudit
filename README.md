@@ -2,7 +2,7 @@
 
 FlagSpecAudit is a GenLayer Intelligent Contract that verifies whether a CLI security claim is consistently supported by its documentation, implementation, and tests.
 
-Live application: [`https://flagspecaudit.pages.dev/`](https://flagspecaudit.pages.dev/). See the [Cloudflare production verification](verification/cloudflare-production.md) and [finalized StudioNet evidence](verification/studionet-verification.md).
+Live application: [`https://flagspecaudit.pages.dev/`](https://flagspecaudit.pages.dev/). See the [Cloudflare production verification](verification/cloudflare-production.md), [finalized StudioNet evidence](verification/studionet-verification.md), and [fresh steward-requested lifecycle proof](verification/steward-followup.md).
 
 ## Architecture
 

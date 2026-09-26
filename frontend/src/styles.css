@@ -45,6 +45,9 @@ nav {
   align-items: center;
   font: 12px DM Mono;
 }
+.network.wrong {
+  color: #ff8b61;
+}
 button {
   font: inherit;
   cursor: pointer;
@@ -177,6 +180,19 @@ form > p {
   width: 11px;
   height: 11px;
 }
+.sync-state {
+  margin-top: 10px;
+  font: 9px DM Mono;
+  letter-spacing: 1px;
+  color: #777;
+}
+.sync-state.live {
+  color: #08703d;
+}
+.sync-state.stale,
+.sync-state.unavailable {
+  color: #a64a18;
+}
 .row {
   width: 100%;
   display: grid;
@@ -258,9 +274,39 @@ mark {
   display: flex;
   gap: 12px;
   align-items: center;
+  z-index: 10;
+  max-width: min(900px, 92vw);
+  font-size: 13px;
+}
+.notice > span {
+  line-height: 1.35;
 }
 .notice a {
   color: #ff7a2d;
+  white-space: nowrap;
+}
+.notice button {
+  border: 1px solid #ff7a2d;
+  background: transparent;
+  color: #ff7a2d;
+  padding: 6px 9px;
+  white-space: nowrap;
+}
+.notice mark.tx-phase {
+  background: #333;
+  color: white;
+  white-space: nowrap;
+}
+.notice mark.finalized {
+  background: #164d35;
+}
+.notice mark.rejected,
+.notice mark.failed,
+.notice mark.reverted {
+  background: #6d241e;
+}
+.notice mark.timeout {
+  background: #6b4d14;
 }
 .spin {
   animation: spin 1s linear infinite;
